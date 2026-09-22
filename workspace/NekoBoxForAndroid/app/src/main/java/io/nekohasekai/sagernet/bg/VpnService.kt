@@ -11,6 +11,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import io.nekohasekai.sagernet.*
 import io.nekohasekai.sagernet.database.DataStore
+import io.nekohasekai.sagernet.database.ProxyEntity
 import io.nekohasekai.sagernet.database.SagerDatabase
 import io.nekohasekai.sagernet.fmt.LOCALHOST
 import io.nekohasekai.sagernet.fmt.hysteria.HysteriaBean
@@ -86,7 +87,14 @@ class VpnService :
     override val data = BaseService.Data(this)
     override val tag = "SagerNetVpnService"
 
-    override fun createNotification(profileName: String) = ServiceNotification(this, profileName, "service-vpn")
+    override fun createNotification(profile: ProxyEntity?) = ServiceNotification(
+        this,
+        profile?.let {
+            ServiceNotification.genNotificationTitle(it, DataStore.notificationCountryIndicator)
+        }.orEmpty(),
+        "service-vpn",
+        profile = profile,
+    )
 
     override fun onStartCommand(
         intent: Intent?,
@@ -138,9 +146,9 @@ class VpnService :
         plan.inet4Address?.let { builder.addAddress(it.address, it.prefixLength) }
         plan.inet6Address?.let { builder.addAddress(it.address, it.prefixLength) }
 
-        // in-TUN DNS servers (next address of each declared family's prefix)
-        plan.inet4DnsServer?.let { builder.addDnsServer(it) }
-        plan.inet6DnsServer?.let { builder.addDnsServer(it) }
+        // Effective in-TUN DNS servers computed by sing-tun 1.14 from
+        // dns_mode/dns_address and the configured address families.
+        plan.dnsServers.forEach(builder::addDnsServer)
 
         // route ranges flattened by sing-box BuildAutoRouteRanges(true)
         plan.inet4Routes.forEach { builder.addRoute(it.address, it.prefixLength) }

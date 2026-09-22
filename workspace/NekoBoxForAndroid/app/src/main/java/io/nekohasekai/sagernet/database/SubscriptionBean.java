@@ -12,6 +12,8 @@ import io.nekohasekai.sagernet.fmt.Serializable;
 
 public class SubscriptionBean extends Serializable {
 
+    private static final int BANNER_EXPIRATION_TIME = 1 << 5;
+
     public Integer type;
     public String link;
     public String token;
@@ -21,6 +23,7 @@ public class SubscriptionBean extends Serializable {
     public String customUserAgent;
     public Boolean autoUpdate;
     public Integer autoUpdateDelay;
+    public Boolean providerAutoUpdateDefaultsApplied;
     public Integer lastUpdated;
     public Integer filterMode;
     public String filterRegex;
@@ -51,6 +54,7 @@ public class SubscriptionBean extends Serializable {
     // https://github.com/crossutility/Quantumult/blob/master/extra-subscription-feature.md
 
     public String subscriptionUserinfo;
+    public Long expireAt;
     public String announcement;
     public String announcementUrl;
     public String supportUrl;
@@ -63,7 +67,7 @@ public class SubscriptionBean extends Serializable {
 
     @Override
     public void serializeToBuffer(ByteBufferOutput output) {
-        output.writeInt(6);
+        output.writeInt(8);
 
         output.writeInt(type);
 
@@ -107,10 +111,16 @@ public class SubscriptionBean extends Serializable {
         output.writeInt(routingUpdateInterval);
         output.writeLong(routingLastUpdated);
         output.writeBoolean(routingOff);
+
+        // v7
+        output.writeLong(expireAt);
+
+        // v8
+        output.writeBoolean(providerAutoUpdateDefaultsApplied);
     }
 
     public void serializeForShare(ByteBufferOutput output) {
-        output.writeInt(1);
+        output.writeInt(2);
 
         output.writeInt(type);
 
@@ -176,6 +186,17 @@ public class SubscriptionBean extends Serializable {
             routingLastUpdated = input.readLong();
             routingOff = input.readBoolean();
         }
+        if (version >= 7) {
+            expireAt = input.readLong();
+        } else if (bannerLayout != null) {
+            bannerLayout |= BANNER_EXPIRATION_TIME;
+        }
+        if (version >= 8) {
+            providerAutoUpdateDefaultsApplied = input.readBoolean();
+        } else {
+            // Existing subscriptions must never have provider defaults applied again.
+            providerAutoUpdateDefaultsApplied = true;
+        }
     }
 
     public void deserializeFromShare(ByteBufferInput input) {
@@ -191,6 +212,9 @@ public class SubscriptionBean extends Serializable {
         if (version >= 1) {
             bannerLayout = input.readInt();
         }
+        if (version < 2 && bannerLayout != null) {
+            bannerLayout |= BANNER_EXPIRATION_TIME;
+        }
     }
 
     @Override
@@ -204,19 +228,21 @@ public class SubscriptionBean extends Serializable {
         if (customUserAgent == null) customUserAgent = "";
         if (autoUpdate == null) autoUpdate = false;
         if (autoUpdateDelay == null) autoUpdateDelay = 1440;
+        if (providerAutoUpdateDefaultsApplied == null) providerAutoUpdateDefaultsApplied = false;
         if (lastUpdated == null) lastUpdated = 0;
         if (filterMode == null) filterMode = 0;
         if (filterRegex == null) filterRegex = "";
         if (hwidEnabled == null) hwidEnabled = false;
         if (spoofApp == null) spoofApp = 0;
         if (serverDnsResolver == null) serverDnsResolver = "";
-        if (bannerLayout == null) bannerLayout = 31;
+        if (bannerLayout == null) bannerLayout = 63;
         if (announcement == null) announcement = "";
         if (announcementUrl == null) announcementUrl = "";
         if (supportUrl == null) supportUrl = "";
         if (supportEmail == null) supportEmail = "";
         if (profileWebPageUrl == null) profileWebPageUrl = "";
         if (homepage == null) homepage = "";
+        if (expireAt == null) expireAt = 0L;
         if (routingEnabled == null) routingEnabled = false;
         if (routingPayload == null) routingPayload = "";
         if (routingFormat == null) routingFormat = "";

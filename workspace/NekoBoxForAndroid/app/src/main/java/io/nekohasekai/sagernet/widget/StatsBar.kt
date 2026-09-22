@@ -32,12 +32,16 @@ import com.google.android.material.shape.MaterialShapeDrawable
 import com.google.android.material.shape.ShapeAppearanceModel
 import io.nekohasekai.sagernet.Key
 import io.nekohasekai.sagernet.R
+import io.nekohasekai.sagernet.SagerNet
+import io.nekohasekai.sagernet.aidl.ISagerNetService
+import io.nekohasekai.sagernet.bg.AutomaticConnectionTestPolicy
 import io.nekohasekai.sagernet.bg.BaseService
 import io.nekohasekai.sagernet.bg.proto.ProfileStatusUpdater
 import io.nekohasekai.sagernet.database.DataStore
 import io.nekohasekai.sagernet.ktx.*
 import io.nekohasekai.sagernet.ui.MainActivity
 import io.nekohasekai.sagernet.utils.ConnectionIpResolver
+import io.nekohasekai.sagernet.utils.ProfileCountryResolver
 import io.nekohasekai.sagernet.utils.Theme
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -108,13 +112,21 @@ class StatsBar @JvmOverloads constructor(
             if (!value) cancelPendingTransition()
         }
     private var masterDnsVPNResolverChecking = false
-    private var connectedStateHandled = false
-    private var connectionSession = 0
+    private var connectedStateRendered = false
+    private var connectionCheckPolicy = StatsBarConnectionCheckPolicy()
     private val reconnectPolicy = StatsBarReconnectPolicy()
     private var transitionGeneration = 0
     private var transitionJob: Job? = null
     private var connectionTestJob: Job? = null
     private var connectionTestGeneration = 0
+
+    internal fun bindConnectionCheckService(service: ISagerNetService) {
+        connectionCheckPolicy.bindService(service)
+        connectionCheckPolicy.retainedPresentation()?.let { (status, ipInfo) ->
+            renderStatus(status)
+            renderIpInfo(ipInfo)
+        }
+    }
 
     override fun getBehavior(): YourBehavior {
         if (!this::behavior.isInitialized) behavior = YourBehavior()
@@ -226,6 +238,13 @@ class StatsBar @JvmOverloads constructor(
                 applyBarShape()
                 requestLayout()
             }
+        }
+    }
+
+    override fun onFocusChanged(gainFocus: Boolean, direction: Int, previouslyFocusedRect: Rect?) {
+        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+        if (!gainFocus && SagerNet.isTv && !DataStore.serviceState.connected) {
+            post(::hideStats)
         }
     }
 
@@ -432,6 +451,10 @@ class StatsBar @JvmOverloads constructor(
         reconcileAnchoredViewsAfterTransition()
     }
 
+    internal fun revealForTvFocus() {
+        if (allowShow) showStats()
+    }
+
     private fun hideStats() {
         scrollHidden = true
         resetScrollDriverState()
@@ -490,13 +513,23 @@ class StatsBar @JvmOverloads constructor(
         }
     }
 
-    private fun setStatus(text: CharSequence) {
+    private fun setStatus(text: CharSequence, retain: Boolean = true) {
+        if (retain) connectionCheckPolicy.retainStatus(text)
+        renderStatus(text)
+    }
+
+    private fun renderStatus(text: CharSequence) {
         statusText.text = text
         compactStatusText.text = text
         TooltipCompat.setTooltipText(this, buildTooltipText(text))
     }
 
     private fun setIpInfo(text: CharSequence?) {
+        connectionCheckPolicy.retainIpInfo(text)
+        renderIpInfo(text)
+    }
+
+    private fun renderIpInfo(text: CharSequence?) {
         if (text.isNullOrBlank()) {
             ipText.text = " "
             compactIpText.text = " "
@@ -541,22 +574,25 @@ class StatsBar @JvmOverloads constructor(
             isEnabled = true
         }
         if (state != BaseService.State.Connected) {
-            connectedStateHandled = false
-            connectionSession++
+            connectedStateRendered = false
+            connectionCheckPolicy.onDisconnected()
             connectionTestGeneration++
             connectionTestJob?.cancel()
             connectionTestJob = null
         }
         if ((state == BaseService.State.Connected).also { hideOnScroll = it }) {
-            val firstConnectedState = !connectedStateHandled
-            val runAutomaticCheck = firstConnectedState && DataStore.automaticConnectionCheck
-            val currentConnectionSession = connectionSession
-            connectedStateHandled = true
+            val connectedEvent = connectionCheckPolicy.onConnected()
+            val firstConnectedRender = !connectedStateRendered
+            val hasRetainedPresentation =
+                connectionCheckPolicy.retainedPresentation() != null
+            val runAutomaticCheck =
+                connectedEvent.shouldRunAutomaticCheck && DataStore.automaticConnectionCheck
+            connectedStateRendered = true
             scheduleTransition(show = true) {
-                if (currentConnectionSession == connectionSession) {
+                if (connectionCheckPolicy.isCurrent(connectedEvent.session)) {
                     if (runAutomaticCheck && DataStore.serviceState.connected) {
-                        testConnection()
-                    } else if (firstConnectedState) {
+                        testConnection(automatic = true)
+                    } else if (firstConnectedRender && !hasRetainedPresentation) {
                         setStatus(app.getText(R.string.vpn_connected))
                     }
                 }
@@ -586,24 +622,30 @@ class StatsBar @JvmOverloads constructor(
             masterDnsVPNResolverChecking = false
             isEnabled = DataStore.serviceState.connected
             hideOnScroll = true
-            setIpInfo(null)
-            val runAutomaticCheck = !connectedStateHandled && DataStore.automaticConnectionCheck
-            val currentConnectionSession = connectionSession
-            connectedStateHandled = true
-            if (!runAutomaticCheck) setStatus(app.getText(R.string.vpn_connected))
+            val connectedEvent = connectionCheckPolicy.onConnected()
+            val hasRetainedPresentation =
+                connectionCheckPolicy.retainedPresentation() != null
+            val runAutomaticCheck =
+                connectedEvent.shouldRunAutomaticCheck && DataStore.automaticConnectionCheck
+            connectedStateRendered = true
+            if (runAutomaticCheck) {
+                setIpInfo(null)
+            } else if (!hasRetainedPresentation) {
+                setStatus(app.getText(R.string.vpn_connected))
+            }
             scheduleTransition(show = true) {
                 if (
                     runAutomaticCheck &&
-                    currentConnectionSession == connectionSession &&
+                    connectionCheckPolicy.isCurrent(connectedEvent.session) &&
                     DataStore.serviceState.connected
                 ) {
-                    testConnection()
+                    testConnection(automatic = true)
                 }
             }
             return
         }
-        connectedStateHandled = false
-        connectionSession++
+        connectedStateRendered = false
+        connectionCheckPolicy.onDisconnected()
         masterDnsVPNResolverChecking = true
         hideOnScroll = false
         isEnabled = false
@@ -656,23 +698,27 @@ class StatsBar @JvmOverloads constructor(
         compactSpeedDivider.isVisible = visible && !compactSpeedsStacked
     }
 
-    fun testConnection() {
+    fun testConnection(automatic: Boolean = false) {
         val activity = context.mainActivity() ?: return
         val profileId = DataStore.currentProfile
-        val testSession = connectionSession
+        val testSession = connectionCheckPolicy.currentSession
         val testGeneration = ++connectionTestGeneration
         connectionTestJob?.cancel()
         isEnabled = false
-        setStatus(app.getText(R.string.connection_test_testing))
+        setStatus(app.getText(R.string.connection_test_testing), retain = false)
         connectionTestJob = runOnDefaultDispatcher {
             fun isCurrentTest(): Boolean {
-                return testSession == connectionSession &&
+                return connectionCheckPolicy.isCurrent(testSession) &&
                     testGeneration == connectionTestGeneration &&
                     DataStore.serviceState.connected &&
                     DataStore.currentProfile == profileId
             }
             try {
-                val elapsed = activity.urlTest()
+                if (automatic) {
+                    delay(AutomaticConnectionTestPolicy.START_DELAY_MILLIS)
+                    if (!isCurrentTest()) return@runOnDefaultDispatcher
+                }
+                val elapsed = activity.urlTest(automatic)
                 if (!isCurrentTest()) return@runOnDefaultDispatcher
                 updateCurrentProfileStatus(profileId, status = 1, ping = elapsed, error = null)
                 val status = app.getString(
@@ -690,6 +736,24 @@ class StatsBar @JvmOverloads constructor(
                     setIpInfo(null)
                 }
                 val ipInfo = ipResult.await()
+                if (ipInfo != null && isCurrentTest()) {
+                    val countryUpdated = ipInfo.countryCode?.let { countryCode ->
+                        ProfileCountryResolver.updateFromCountryCode(
+                            profileId,
+                            countryCode,
+                            ProfileCountryResolver.SOURCE_OUTBOUND,
+                        )
+                    } ?: ProfileCountryResolver.updateFromAddress(
+                            profileId,
+                            ipInfo.ip,
+                            ProfileCountryResolver.SOURCE_OUTBOUND,
+                        )
+                    if (countryUpdated && isCurrentTest()) {
+                        SagerNet.updateNotificationCountryIndicator(
+                            DataStore.notificationCountryIndicator
+                        )
+                    }
+                }
                 onMainDispatcher {
                     if (!isCurrentTest()) return@onMainDispatcher
                     if (
@@ -699,7 +763,7 @@ class StatsBar @JvmOverloads constructor(
                     ) {
                         setIpInfo(null)
                     } else {
-                        setIpInfo(ipInfo ?: context.getString(R.string.failed_to_obtain_ip))
+                        setIpInfo(ipInfo?.displayText ?: context.getString(R.string.failed_to_obtain_ip))
                     }
                 }
             } catch (_: CancellationException) {

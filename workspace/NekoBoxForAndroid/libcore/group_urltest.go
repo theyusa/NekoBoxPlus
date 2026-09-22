@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -119,6 +120,12 @@ func (t *GroupURLTester) testProfile(ctx context.Context, config, tag string) (l
 		return -1, fmt.Errorf("%w: %w", errGroupURLTestStart, err)
 	}
 	detour, err := instance.urlTestOutbound(tag)
+	if err != nil {
+		return -1, err
+	}
+	readyCtx, cancelReady := context.WithTimeout(ctx, t.timeout)
+	err = waitURLTestOutboundReady(readyCtx, instance.Outbound(), detour)
+	cancelReady()
 	if err != nil {
 		return -1, err
 	}
@@ -267,17 +274,25 @@ func shouldRetryProbe(err error, elapsed, timeout time.Duration) bool {
 }
 
 func TcpPing(host, port string, timeout int32, hardened bool, localTransport LocalDNSTransport) (latency int32, err error) {
+	result, err := TcpPingWithAddress(host, port, timeout, hardened, localTransport)
+	if err != nil {
+		return -1, err
+	}
+	return result.latency, nil
+}
+
+func TcpPingWithAddress(host, port string, timeout int32, hardened bool, localTransport LocalDNSTransport) (result *PingResult, err error) {
 	defer device.DeferPanicToError("TCPPing", func(panicErr error) { err = panicErr })
 	if host == "" {
-		return -1, errors.New("TCP ping host is empty")
+		return nil, errors.New("TCP ping host is empty")
 	}
 	portNumber, parseErr := strconv.ParseUint(port, 10, 16)
 	if parseErr != nil || portNumber == 0 {
-		return -1, fmt.Errorf("invalid TCP ping port %q", port)
+		return nil, fmt.Errorf("invalid TCP ping port %q", port)
 	}
 	probeTimeout := time.Duration(timeout) * time.Millisecond
 	if probeTimeout <= 0 {
-		return -1, errors.New("TCP ping timeout must be positive")
+		return nil, errors.New("TCP ping timeout must be positive")
 	}
 	address := net.JoinHostPort(host, port)
 	dialer := &net.Dialer{Control: protectSocketControl}
@@ -289,20 +304,20 @@ func TcpPing(host, port string, timeout int32, hardened bool, localTransport Loc
 		defer cancel()
 		addresses, lookupErr := resolveHardenedTCPPingHost(ctx, host, localTransport)
 		if lookupErr != nil {
-			return -1, fmt.Errorf("resolve TCP ping host: %w", lookupErr)
+			return nil, fmt.Errorf("resolve TCP ping host: %w", lookupErr)
 		}
 		return runHardenedTCPPing(ctx, addresses, port, dialer.DialContext)
 	}
 	for attempt := range 2 {
 		ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 		started := time.Now()
-		latency, err = speedtest.TCPPing(ctx, dialer.DialContext, address)
+		latency, pingErr := speedtest.TCPPing(ctx, dialer.DialContext, address)
 		cancel()
-		if err == nil {
-			return latency, nil
+		if pingErr == nil {
+			return &PingResult{latency: latency, address: strings.Trim(host, "[]")}, nil
 		}
-		if attempt == 1 || !shouldRetryProbe(err, time.Since(started), probeTimeout) {
-			return -1, err
+		if attempt == 1 || !shouldRetryProbe(pingErr, time.Since(started), probeTimeout) {
+			return nil, pingErr
 		}
 		time.Sleep(probeRetryDelay)
 	}
@@ -314,23 +329,23 @@ func runHardenedTCPPing(
 	addresses []netip.Addr,
 	port string,
 	dial func(context.Context, string, string) (net.Conn, error),
-) (int32, error) {
+) (*PingResult, error) {
 	var lastErr error
 	for {
 		for _, resolvedAddress := range addresses {
 			dialAddress := net.JoinHostPort(resolvedAddress.String(), port)
 			latency, err := speedtest.TCPPing(ctx, dial, dialAddress)
 			if err == nil {
-				return latency, nil
+				return &PingResult{latency: latency, address: resolvedAddress.String()}, nil
 			}
 			lastErr = err
 			if ctx.Err() != nil {
-				return -1, errors.Join(context.Cause(ctx), lastErr)
+				return nil, errors.Join(context.Cause(ctx), lastErr)
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return -1, errors.Join(context.Cause(ctx), lastErr)
+			return nil, errors.Join(context.Cause(ctx), lastErr)
 		case <-time.After(probeRetryDelay):
 		}
 	}

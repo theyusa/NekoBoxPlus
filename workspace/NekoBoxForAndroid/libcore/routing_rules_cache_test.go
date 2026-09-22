@@ -169,6 +169,40 @@ func TestPrepareRoutingRuleSetsRejectsDuplicateTags(t *testing.T) {
 	}
 }
 
+func TestPrepareRoutingRuleSetsExpandsMultiTagDefinitions(t *testing.T) {
+	cacheDir, assetsDir := configureRoutingRulesTest(t)
+	writeRoutingRulesTestAssets(t, assetsDir, "1", "1")
+	options := option.Options{
+		Route: &option.RouteOptions{
+			Rules: []option.Rule{{
+				Type: C.RuleTypeDefault,
+				DefaultOptions: option.DefaultRule{RawDefaultRule: option.RawDefaultRule{
+					RuleSet: []string{"us", "cn"},
+				}},
+			}},
+			RuleSet: []option.RuleSet{{
+				Type:         C.RuleSetTypeLocal,
+				Tag:          []string{"us", "cn", "unused"},
+				Format:       C.RuleSetFormatBinary,
+				LocalOptions: option.LocalRuleSet{Path: "geoip:{tag}"},
+			}},
+		},
+	}
+
+	loaded, err := prepareRoutingRuleSets(&options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded {
+		t.Fatal("expected multi-tag definitions to load geo resources")
+	}
+	assertPreparedRoutingRules(t, options, 2)
+	if options.Route.RuleSet[0].Tag[0] != "us" || options.Route.RuleSet[1].Tag[0] != "cn" {
+		t.Fatalf("unexpected expanded tags: %q, %q", options.Route.RuleSet[0].Tag, options.Route.RuleSet[1].Tag)
+	}
+	assertRoutingRulesCacheKeys(t, cacheDir, routingRuleGeoIP, []string{"geoip:cn", "geoip:us"})
+}
+
 func TestPrepareRoutingRuleSetsSynthesizesDNSOnlyDefinitions(t *testing.T) {
 	cacheDir, assetsDir := configureRoutingRulesTest(t)
 	writeRoutingRulesTestAssets(t, assetsDir, "1", "1")
@@ -273,19 +307,19 @@ func routingRulesTestOptions(includeChina bool) option.Options {
 	ruleSets := []option.RuleSet{
 		{
 			Type:         C.RuleSetTypeLocal,
-			Tag:          "geo-us",
+			Tag:          []string{"geo-us"},
 			Format:       C.RuleSetFormatBinary,
 			LocalOptions: option.LocalRuleSet{Path: "geoip:US"},
 		},
 		{
 			Type:         C.RuleSetTypeLocal,
-			Tag:          "site-test",
+			Tag:          []string{"site-test"},
 			Format:       C.RuleSetFormatBinary,
 			LocalOptions: option.LocalRuleSet{Path: "geosite:test"},
 		},
 		{
 			Type:         C.RuleSetTypeLocal,
-			Tag:          "unused-site",
+			Tag:          []string{"unused-site"},
 			Format:       C.RuleSetFormatBinary,
 			LocalOptions: option.LocalRuleSet{Path: "geosite:unused"},
 		},
@@ -294,7 +328,7 @@ func routingRulesTestOptions(includeChina bool) option.Options {
 		geoReferences = append(geoReferences, "geo-cn")
 		ruleSets = append(ruleSets, option.RuleSet{
 			Type:         C.RuleSetTypeLocal,
-			Tag:          "geo-cn",
+			Tag:          []string{"geo-cn"},
 			Format:       C.RuleSetFormatBinary,
 			LocalOptions: option.LocalRuleSet{Path: "geoip:cn"},
 		})
@@ -343,7 +377,10 @@ func assertPreparedRoutingRules(t *testing.T, options option.Options, expected i
 			t.Fatalf("rule-set %s has unexpected rules: %#v", ruleSet.Tag, ruleSet.InlineOptions.Rules)
 		}
 		prepared := ruleSet.InlineOptions.Rules[0].DefaultOptions
-		if ruleSet.Tag == "site-test" {
+		if len(ruleSet.Tag) != 1 {
+			t.Fatalf("prepared rule-set has multiple tags: %q", ruleSet.Tag)
+		}
+		if ruleSet.Tag[0] == "site-test" {
 			if prepared.DomainMatcher == nil {
 				t.Fatal("expected compiled geosite domain matcher")
 			}

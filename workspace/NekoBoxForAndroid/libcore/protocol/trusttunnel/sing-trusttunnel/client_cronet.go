@@ -18,12 +18,13 @@ import (
 
 	"github.com/sagernet/cronet-go"
 	_ "github.com/sagernet/cronet-go/all"
-	"github.com/sagernet/sing-box/common/cronetbidistream"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+
+	"libcore/protocol/trusttunnel/sing-trusttunnel/internal/cronetbidistream"
 )
 
 const cronetCloseTimeout = 5 * time.Second
@@ -291,7 +292,7 @@ func (c *Client) newCronetRoundTripper(options ClientOptions, quic bool) (RoundT
 	}
 
 	params := cronet.NewEngineParams()
-	params.SetUserAgent(TCPUserAgent)
+	params.SetUserAgent(c.userAgents.TCPUserAgent)
 
 	if quic && options.ForceQUIC {
 		params.SetEnableHTTP2(false)

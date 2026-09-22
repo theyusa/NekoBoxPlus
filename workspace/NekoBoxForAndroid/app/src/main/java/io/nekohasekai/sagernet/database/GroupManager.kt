@@ -2,6 +2,7 @@ package io.nekohasekai.sagernet.database
 
 import io.nekohasekai.sagernet.GroupType
 import io.nekohasekai.sagernet.bg.SubscriptionUpdater
+import io.nekohasekai.sagernet.group.GroupUpdater
 import io.nekohasekai.sagernet.ktx.applyDefaultValues
 import io.nekohasekai.sagernet.routing.SubscriptionRoutingRepository
 
@@ -64,16 +65,16 @@ object GroupManager {
 
     suspend fun clearGroup(groupId: Long) {
         DataStore.selectedProxy = 0L
-        SagerDatabase.proxyDao.deleteAll(groupId)
+        AppData.profiles.deleteAll(groupId)
         iterator { groupUpdated(groupId) }
     }
 
     fun rearrange(groupId: Long) {
-        val entities = SagerDatabase.proxyDao.getByGroup(groupId)
+        val entities = AppData.profiles.getByGroup(groupId)
         for (index in entities.indices) {
             entities[index].userOrder = (index + 1).toLong()
         }
-        SagerDatabase.proxyDao.updateProxy(entities)
+        AppData.profiles.updateProxy(entities)
     }
 
     suspend fun postUpdate(group: ProxyGroup) {
@@ -81,7 +82,7 @@ object GroupManager {
     }
 
     suspend fun postUpdate(groupId: Long) {
-        postUpdate(SagerDatabase.groupDao.getById(groupId) ?: return)
+        postUpdate(AppData.groups.getById(groupId) ?: return)
     }
 
     suspend fun postReload(groupId: Long, reason: ReloadReason = ReloadReason.General) {
@@ -93,8 +94,8 @@ object GroupManager {
     }
 
     suspend fun createGroup(group: ProxyGroup): ProxyGroup {
-        group.userOrder = SagerDatabase.groupDao.nextOrder() ?: 1
-        group.id = SagerDatabase.groupDao.createGroup(group.applyDefaultValues())
+        group.userOrder = AppData.groups.nextOrder() ?: 1
+        group.id = AppData.groups.createGroup(group.applyDefaultValues())
         iterator { groupAdd(group) }
         if (group.type == GroupType.SUBSCRIPTION) {
             SubscriptionUpdater.reconfigureUpdater()
@@ -103,34 +104,53 @@ object GroupManager {
     }
 
     suspend fun updateGroup(group: ProxyGroup) {
-        SagerDatabase.groupDao.updateGroup(group)
+        val previous = AppData.groups.getById(group.id)
+        val previousSubscription = previous?.subscription
+        val updatedSubscription = group.subscription
+        if (
+            previous?.type == GroupType.SUBSCRIPTION &&
+            (
+                group.type != GroupType.SUBSCRIPTION ||
+                    previousSubscription?.link != updatedSubscription?.link ||
+                    (previousSubscription?.autoUpdate == true && updatedSubscription?.autoUpdate != true)
+            )
+        ) {
+            GroupUpdater.cancelUpdate(group.id)
+        }
+        AppData.groups.updateGroup(group)
         iterator { groupUpdated(group) }
         SubscriptionUpdater.reconfigureUpdater()
     }
 
     suspend fun deleteGroup(groupId: Long) {
+        GroupUpdater.cancelUpdate(groupId)
+        AppData.transactions.run {
+            AppData.groups.deleteById(groupId)
+            AppData.profiles.deleteByGroup(groupId)
+        }
         SubscriptionRoutingRepository.deleteFiles(groupId)
-        SagerDatabase.groupDao.deleteById(groupId)
-        SagerDatabase.proxyDao.deleteByGroup(groupId)
         iterator { groupRemoved(groupId) }
         ensureFallbackGroup()
         SubscriptionUpdater.reconfigureUpdater()
     }
 
     suspend fun deleteGroup(group: List<ProxyGroup>) {
+        GroupUpdater.cancelUpdates(group.map { it.id })
+        AppData.transactions.run {
+            AppData.groups.deleteGroup(group)
+            AppData.profiles.deleteByGroup(group.map { it.id }.toLongArray())
+        }
         group.forEach { SubscriptionRoutingRepository.deleteFiles(it.id) }
-        SagerDatabase.groupDao.deleteGroup(group)
-        SagerDatabase.proxyDao.deleteByGroup(group.map { it.id }.toLongArray())
         for (proxyGroup in group) iterator { groupRemoved(proxyGroup.id) }
         ensureFallbackGroup()
         SubscriptionUpdater.reconfigureUpdater()
     }
 
     private suspend fun ensureFallbackGroup() {
-        val groups = SagerDatabase.groupDao.allGroups()
+        val groups = AppData.groups.allGroups()
         if (groups.isEmpty()) {
             val group = ProxyGroup(ungrouped = true)
-            group.id = SagerDatabase.groupDao.createGroup(group)
+            group.id = AppData.groups.createGroup(group)
             DataStore.selectedGroup = group.id
             iterator { groupAdd(group) }
             return
@@ -142,7 +162,7 @@ object GroupManager {
 
     fun canDelete(groupId: Long): Boolean {
         if (groupId <= 0L) return false
-        return SagerDatabase.groupDao.allGroups().size > 1
+        return AppData.groups.allGroups().size > 1
     }
 
 }

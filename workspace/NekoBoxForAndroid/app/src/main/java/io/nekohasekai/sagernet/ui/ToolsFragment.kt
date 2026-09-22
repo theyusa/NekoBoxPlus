@@ -1,16 +1,25 @@
 package io.nekohasekai.sagernet.ui
 
 import android.os.Bundle
+import android.view.LayoutInflater
 import android.view.View
-import androidx.core.view.ViewCompat
+import android.view.ViewGroup
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.fragment.app.Fragment
 import androidx.viewpager2.adapter.FragmentStateAdapter
-import com.google.android.material.tabs.TabLayoutMediator
+import androidx.viewpager2.widget.ViewPager2
+import androidx.recyclerview.widget.RecyclerView
+import io.nekohasekai.sagernet.SagerNet
 import io.nekohasekai.sagernet.R
-import io.nekohasekai.sagernet.databinding.LayoutToolsBinding
-import io.nekohasekai.sagernet.widget.ListListener
+import io.nekohasekai.sagernet.ui.compose.NekoComposeTheme
+import io.nekohasekai.sagernet.ui.compose.ToolsScreen
 
-class ToolsFragment : ToolbarFragment(R.layout.layout_tools) {
+class ToolsFragment : ToolbarFragment() {
 
     companion object {
         private const val ARG_INITIAL_PAGE = "initialPage"
@@ -21,28 +30,52 @@ class ToolsFragment : ToolbarFragment(R.layout.layout_tools) {
         }
     }
 
-    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
-        super.onViewCreated(view, savedInstanceState)
-        toolbar.setTitle(R.string.menu_tools)
-
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?,
+    ): View {
         val tools = mutableListOf<NamedFragment>()
         tools.add(NetworkFragment())
         tools.add(BackupFragment())
-
-        val binding = LayoutToolsBinding.bind(view)
-        ViewCompat.setOnApplyWindowInsetsListener(binding.root, ListListener)
-        binding.toolsPager.adapter = ToolsAdapter(tools)
-
-        TabLayoutMediator(binding.toolsTab, binding.toolsPager) { tab, position ->
-            tab.text = tools[position].name()
-            tab.view.setOnLongClickListener { // clear toast
-                true
+        val initialPage = arguments?.getInt(ARG_INITIAL_PAGE, 0) ?: 0
+        return ComposeView(requireContext()).apply {
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+            setContent {
+                var selectedPage by rememberSaveable { mutableIntStateOf(initialPage) }
+                NekoComposeTheme {
+                    ToolsScreen(
+                        pageNames = tools.map { it.name() },
+                        selectedPage = selectedPage,
+                        onOpenDrawer = { (requireActivity() as MainActivity).openDrawer() },
+                        onPageSelected = { selectedPage = it },
+                        createPager = {
+                            ViewPager2(requireContext()).apply {
+                                id = View.generateViewId()
+                                adapter = ToolsAdapter(tools)
+                                setCurrentItem(initialPage, false)
+                                if (SagerNet.isTv) {
+                                    isUserInputEnabled = false
+                                    isFocusable = false
+                                    descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+                                    (getChildAt(0) as? RecyclerView)?.apply {
+                                        isFocusable = false
+                                        descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+                                    }
+                                }
+                                registerOnPageChangeCallback(
+                                    object : ViewPager2.OnPageChangeCallback() {
+                                        override fun onPageSelected(position: Int) {
+                                            selectedPage = position
+                                        }
+                                    },
+                                )
+                            }
+                        },
+                    )
+                }
             }
-        }.attach()
-        binding.toolsPager.setCurrentItem(
-            arguments?.getInt(ARG_INITIAL_PAGE, 0) ?: 0,
-            false,
-        )
+        }
     }
 
     inner class ToolsAdapter(val tools: List<Fragment>) : FragmentStateAdapter(this) {

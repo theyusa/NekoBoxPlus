@@ -3,6 +3,7 @@ package io.nekohasekai.sagernet.group
 import io.nekohasekai.sagernet.fmt.hysteria.HysteriaBean
 import io.nekohasekai.sagernet.fmt.masque.MasqueBean
 import io.nekohasekai.sagernet.fmt.mieru.MieruBean
+import io.nekohasekai.sagernet.fmt.openvpn.OpenVPNBean
 import io.nekohasekai.sagernet.fmt.shadowsocks.ShadowsocksBean
 import io.nekohasekai.sagernet.fmt.shadowsocksr.ShadowsocksRBean
 import io.nekohasekai.sagernet.fmt.snell.SnellBean
@@ -47,12 +48,12 @@ class ClashParserTest {
                   - {name: masque, type: masque, server: 192.0.2.1, port: 443, private-key: private, public-key: public}
                   - {name: trust, type: trusttunnel, server: trust.example, port: 443, username: user, password: secret}
                   - {name: tailscale, type: tailscale, auth-key: tskey-auth-test, hostname: android}
-                  - {name: unsupported, type: openvpn, server: vpn.example, port: 1194}
+                  - {name: openvpn, type: openvpn, server: vpn.example, port: 1194}
                   - {name: utility, type: direct}
                 """.trimIndent(),
             )!!
 
-        assertEquals(18, proxies.size)
+        assertEquals(19, proxies.size)
         assertTrue(proxies[0] is SOCKSBean)
         assertTrue(proxies[2] is ShadowsocksBean)
         assertTrue(proxies[3] is ShadowsocksRBean)
@@ -69,7 +70,8 @@ class ClashParserTest {
         assertTrue(proxies[15] is MasqueBean)
         assertTrue(proxies[16] is TrustTunnelBean)
         assertTrue(proxies[17] is TailscaleBean)
-        assertFalse(proxies.any { it.name == "unsupported" || it.name == "utility" })
+        assertTrue(proxies[18] is OpenVPNBean)
+        assertFalse(proxies.any { it.name == "utility" })
     }
 
     @Test
@@ -118,10 +120,12 @@ class ClashParserTest {
         assertTrue(proxy.muxBrutal)
         assertEquals(120, proxy.muxBrutalUpMbps)
         assertEquals(240, proxy.muxBrutalDownMbps)
+        assertTrue(proxy.tcpFastOpen)
+        assertTrue(proxy.tcpMultiPath)
 
         val custom = JSONObject(proxy.customOutboundJson)
-        assertTrue(custom.getBoolean("tcp_fast_open"))
-        assertTrue(custom.getBoolean("tcp_multi_path"))
+        assertFalse(custom.has("tcp_fast_open"))
+        assertFalse(custom.has("tcp_multi_path"))
         assertEquals("wlan0", custom.getString("bind_interface"))
         assertEquals(42, custom.getInt("routing_mark"))
         assertEquals("prefer_ipv6", custom.getString("domain_strategy"))

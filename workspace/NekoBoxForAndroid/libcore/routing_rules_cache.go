@@ -81,10 +81,12 @@ func prepareRoutingRuleSetsWithPaths(options *option.Options, assetsPath string,
 	if options.Route != nil {
 		definitions = make(map[string]option.RuleSet, len(options.Route.RuleSet))
 		for _, definition := range options.Route.RuleSet {
-			if _, exists := definitions[definition.Tag]; exists {
-				return false, fmt.Errorf("duplicate rule-set tag: %s", definition.Tag)
+			for _, tag := range definition.Tag {
+				if _, exists := definitions[tag]; exists {
+					return false, fmt.Errorf("duplicate rule-set tag: %s", tag)
+				}
+				definitions[tag] = definition
 			}
-			definitions[definition.Tag] = definition
 		}
 	}
 
@@ -104,7 +106,7 @@ func prepareRoutingRuleSetsWithPaths(options *option.Options, assetsPath string,
 			}
 			definition = option.RuleSet{
 				Type:         C.RuleSetTypeLocal,
-				Tag:          tag,
+				Tag:          []string{tag},
 				Format:       C.RuleSetFormatBinary,
 				LocalOptions: option.LocalRuleSet{Path: tag},
 			}
@@ -114,7 +116,8 @@ func prepareRoutingRuleSetsWithPaths(options *option.Options, assetsPath string,
 		if definition.Type != C.RuleSetTypeLocal {
 			continue
 		}
-		kind, key, loaded := parseRoutingRuleKey(definition.LocalOptions.Path)
+		path := strings.ReplaceAll(definition.LocalOptions.Path, C.RuleSetTagPlaceholder, tag)
+		kind, key, loaded := parseRoutingRuleKey(path)
 		if loaded {
 			requests[kind][key] = struct{}{}
 		}
@@ -130,23 +133,38 @@ func prepareRoutingRuleSetsWithPaths(options *option.Options, assetsPath string,
 
 	ruleSets := make([]option.RuleSet, 0, len(options.Route.RuleSet))
 	for _, definition := range options.Route.RuleSet {
-		kind, key, pseudo := parseRoutingRuleKey(definition.LocalOptions.Path)
-		if definition.Type != C.RuleSetTypeLocal || !pseudo {
+		if definition.Type != C.RuleSetTypeLocal {
 			ruleSets = append(ruleSets, definition)
 			continue
 		}
-		if _, referenced := referencedTags[definition.Tag]; !referenced {
-			continue
+
+		var retainedTags []string
+		for _, tag := range definition.Tag {
+			path := strings.ReplaceAll(definition.LocalOptions.Path, C.RuleSetTagPlaceholder, tag)
+			kind, key, pseudo := parseRoutingRuleKey(path)
+			if !pseudo {
+				retainedTags = append(retainedTags, tag)
+				continue
+			}
+			if _, referenced := referencedTags[tag]; !referenced {
+				continue
+			}
+			rules, loaded := prepared[kind][key]
+			if !loaded {
+				return loadedFromResource, fmt.Errorf("routing rule %s was not prepared", key)
+			}
+			inlineDefinition := definition
+			inlineDefinition.Type = C.RuleSetTypeInline
+			inlineDefinition.Tag = []string{tag}
+			inlineDefinition.Format = ""
+			inlineDefinition.LocalOptions = option.LocalRuleSet{}
+			inlineDefinition.InlineOptions = option.PlainRuleSet{Rules: rules}
+			ruleSets = append(ruleSets, inlineDefinition)
 		}
-		rules, loaded := prepared[kind][key]
-		if !loaded {
-			return loadedFromResource, fmt.Errorf("routing rule %s was not prepared", key)
+		if len(retainedTags) > 0 {
+			definition.Tag = retainedTags
+			ruleSets = append(ruleSets, definition)
 		}
-		definition.Type = C.RuleSetTypeInline
-		definition.Format = ""
-		definition.LocalOptions = option.LocalRuleSet{}
-		definition.InlineOptions = option.PlainRuleSet{Rules: rules}
-		ruleSets = append(ruleSets, definition)
 	}
 	options.Route.RuleSet = ruleSets
 	return loadedFromResource, nil

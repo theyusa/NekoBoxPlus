@@ -22,9 +22,10 @@ import io.nekohasekai.sagernet.aidl.ISagerNetService
 import io.nekohasekai.sagernet.aidl.ISagerNetServiceCallback
 import io.nekohasekai.sagernet.aidl.SpeedTestData
 import io.nekohasekai.sagernet.bg.proto.ProxyInstance
+import io.nekohasekai.sagernet.database.AppData
 import io.nekohasekai.sagernet.database.DataStore
+import io.nekohasekai.sagernet.database.ProxyEntity
 import io.nekohasekai.sagernet.database.RuleEntity
-import io.nekohasekai.sagernet.database.SagerDatabase
 import io.nekohasekai.sagernet.ktx.*
 import io.nekohasekai.sagernet.plugin.PluginManager
 import io.nekohasekai.sagernet.utils.DefaultNetworkListener
@@ -141,6 +142,14 @@ class BaseService {
                             .show()
                     }
                 }
+                Action.UPDATE_NOTIFICATION_COUNTRY_INDICATOR -> runOnDefaultDispatcher {
+                    notification?.postNotificationCountryIndicator(
+                        intent.getBooleanExtra(
+                            Action.EXTRA_NOTIFICATION_COUNTRY_INDICATOR_ENABLED,
+                            DataStore.notificationCountryIndicator,
+                        )
+                    )
+                }
 
                 else -> service.stopRunner()
             }
@@ -155,7 +164,12 @@ class BaseService {
             if (state == s && msg == null) return
             state = s
             DataStore.serviceState = s
+            if (s != State.Connected) binder.resetConnectionTestState()
             binder.stateChanged(s, msg)
+        }
+
+        fun restartService() {
+            service.stopRunner(restart = true)
         }
     }
 
@@ -190,6 +204,7 @@ class BaseService {
         private var speedTestSession: SpeedTestSession? = null
         @Volatile
         private var latestSpeedTestStatus = SpeedTestData()
+        private val connectionTestSession = ConnectionTestSessionState()
 
         suspend fun broadcast(work: (ISagerNetServiceCallback) -> Unit) {
             broadcastMutex.withLock {
@@ -219,9 +234,14 @@ class BaseService {
             }
         }
 
-        override fun urlTest(): Int {
+        override fun urlTest(automatic: Boolean): Int {
             val data = data ?: error("core not started")
             val box = data.proxy?.box ?: error("core not started")
+            val retryPlan = AutomaticConnectionTestPolicy.retryPlan(
+                automatic,
+                DataStore.connectionTestAttempts,
+                DataStore.connectionTestPause,
+            )
             try {
                 return data.urlTestTracker.track {
                     Libcore.urlTest(
@@ -229,14 +249,30 @@ class BaseService {
                         DataStore.connectionTestURL,
                         DataStore.connectionTestTimeout,
                         DataStore.profileTestType,
-                        DataStore.connectionTestAttempts,
-                        DataStore.connectionTestPause,
+                        retryPlan.attempts,
+                        retryPlan.pauseMillis,
                         DataStore.connectionTestHardened,
                     )
                 }
             } catch (e: Exception) {
                 error(e.readableMessage)
             }
+        }
+
+        override fun claimAutomaticConnectionCheck(): Boolean {
+            return connectionTestSession.claim(data?.state == State.Connected)
+        }
+
+        override fun connectionTestStatus(): String? = connectionTestSession.presentation()?.status
+
+        override fun connectionTestIpInfo(): String? = connectionTestSession.presentation()?.ipInfo
+
+        override fun setConnectionTestPresentation(status: String?, ipInfo: String?) {
+            connectionTestSession.setPresentation(data?.state == State.Connected, status, ipInfo)
+        }
+
+        fun resetConnectionTestState() {
+            connectionTestSession.reset()
         }
 
         override fun startSpeedTest(
@@ -358,8 +394,14 @@ class BaseService {
         }
 
         override fun setClashMode(mode: String) {
-            val box = data?.proxy?.box ?: return
+            val data = data ?: return
+            val box = data.proxy?.box ?: return
+            val oldMode = Libcore.currentClashMode(box)
             Libcore.setClashMode(box, mode)
+            val newMode = Libcore.currentClashMode(box)
+            if (!oldMode.equals(newMode, ignoreCase = true)) {
+                data.restartService()
+            }
         }
 
         override fun setLogLevel(level: String, enabled: Boolean) {
@@ -542,7 +584,7 @@ class BaseService {
     interface Interface {
         val data: Data
         val tag: String
-        fun createNotification(profileName: String): ServiceNotification
+        fun createNotification(profile: ProxyEntity?): ServiceNotification
 
         fun onBind(intent: Intent): IBinder? =
             if (intent.action == Action.SERVICE) data.binder else null
@@ -564,7 +606,7 @@ class BaseService {
                     stopRunner(false, (this as Context).getString(R.string.profile_empty))
                 }
                 ServiceLifecyclePolicy.ReloadAction.SelectorReload -> {
-                    val ent = SagerDatabase.proxyDao.getById(selectedProxy)
+                    val ent = AppData.profiles.getById(selectedProxy)
                     val tag = data.proxy!!.config.profileTagMap[ent?.id] ?: ""
                     if (tag.isNotBlank() && ent != null) {
                         // select from GUI
@@ -594,7 +636,7 @@ class BaseService {
 
         fun canReloadSelector(selectedProxy: Long = DataStore.selectedProxy): Boolean {
             if ((data.proxy?.config?.selectorGroupId ?: -1L) < 0) return false
-            val ent = SagerDatabase.proxyDao.getById(selectedProxy) ?: return false
+            val ent = AppData.profiles.getById(selectedProxy) ?: return false
             val tmpBox = ProxyInstance(ent)
             tmpBox.buildConfigTmp()
             if (tmpBox.lastSelectorGroupId == data.proxy?.lastSelectorGroupId) {
@@ -608,7 +650,7 @@ class BaseService {
         }
 
         fun hasActiveWifiRules(): Boolean {
-            return SagerDatabase.rulesDao.enabledRules().any { RuleEntity.hasActiveWifiIdentity(it) }
+            return AppData.rules.enabledRules().any { RuleEntity.hasActiveWifiIdentity(it) }
         }
 
         fun startRunner(
@@ -1067,12 +1109,16 @@ class BaseService {
                 upstreamInterfaceName = currentName
                 val decision = networkChangeRecoveryPolicy.onNetworkChanged(
                     interfaceName = currentName,
+                    networkHandle = network?.networkHandle,
                     isVpnNetwork = isVpnNetwork(network),
                     reconnectEnabled = DataStore.networkChangeReconnect,
                     resetEnabled = DataStore.networkChangeResetConnections,
                 )
                 if (decision.reconnect || decision.reset) {
-                    Logs.d("Network changed: ${decision.oldInterfaceName} -> ${decision.newInterfaceName}")
+                    Logs.d(
+                        "Network changed: ${decision.oldInterfaceName}/${decision.oldNetworkHandle} -> " +
+                            "${decision.newInterfaceName}/${decision.newNetworkHandle}"
+                    )
                     data.networkRecoveryJob?.cancel()
                     data.networkRecoveryJob = runOnDefaultDispatcher {
                         delay(NETWORK_RECOVERY_DEBOUNCE_MS)
@@ -1086,7 +1132,8 @@ class BaseService {
                 if (decision.ignoredReconnectForVpn) {
                     Logs.d(
                         "Ignore VPN network change for reconnect: " +
-                            "${decision.oldInterfaceName} -> ${decision.newInterfaceName}"
+                            "${decision.oldInterfaceName}/${decision.oldNetworkHandle} -> " +
+                            "${decision.newInterfaceName}/${decision.newNetworkHandle}"
                     )
                 }
             }
@@ -1165,10 +1212,10 @@ class BaseService {
                 return Service.START_NOT_STICKY
             }
             data.desiredProfileId = requestedProfileId
-            val profile = SagerDatabase.proxyDao.getById(requestedProfileId)
+            val profile = AppData.profiles.getById(requestedProfileId)
             this as Context
             if (profile == null) { // gracefully shutdown: https://stackoverflow.com/q/47337857/2245107
-                data.notification = createNotification("")
+                data.notification = createNotification(null)
                 stopRunner(false, getString(R.string.profile_empty))
                 return Service.START_NOT_STICKY
             }
@@ -1188,6 +1235,7 @@ class BaseService {
                         addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
                     }
                     addAction(Action.RESET_UPSTREAM_CONNECTIONS)
+                    addAction(Action.UPDATE_NOTIFICATION_COUNTRY_INDICATOR)
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     registerReceiver(
@@ -1213,7 +1261,7 @@ class BaseService {
                 data.lifecycleMutex.withLock {
                     try {
                         withContext(Dispatchers.Main.immediate) {
-                            data.notification = createNotification(ServiceNotification.genTitle(profile))
+                            data.notification = createNotification(profile)
                         }
 
                         Executable.killAll()    // clean up old processes

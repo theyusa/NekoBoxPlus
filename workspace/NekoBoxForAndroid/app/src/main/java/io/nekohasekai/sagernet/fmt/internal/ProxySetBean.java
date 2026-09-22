@@ -28,6 +28,7 @@ public class ProxySetBean extends InternalBean {
 
     public int type = TYPE_LIST;
     public List<Long> proxies = new ArrayList<>();
+    public String embeddedProfilesJson = "[]";
     public long groupId = 0L;
     public String groupFilterNotRegex = "";
     public boolean skipInsecureProfiles = false;
@@ -49,6 +50,7 @@ public class ProxySetBean extends InternalBean {
             mode = MODE_SELECTOR;
         }
         if (proxies == null) proxies = new ArrayList<>();
+        if (JavaUtil.isNullOrBlank(embeddedProfilesJson)) embeddedProfilesJson = "[]";
         if (groupFilterNotRegex == null) groupFilterNotRegex = "";
         if (JavaUtil.isNullOrBlank(testURL)) testURL = CONNECTION_TEST_URL;
         if (JavaUtil.isNullOrBlank(testInterval)) testInterval = "3m";
@@ -66,7 +68,7 @@ public class ProxySetBean extends InternalBean {
 
     @Override
     public void serialize(ByteBufferOutput output) {
-        output.writeInt(3);
+        output.writeInt(4);
         output.writeBoolean(interruptExistConnections);
         output.writeString(testURL);
         output.writeString(testInterval);
@@ -87,6 +89,7 @@ public class ProxySetBean extends InternalBean {
         output.writeInt(mode);
         output.writeLong(defaultOutbound);
         output.writeBoolean(skipInsecureProfiles);
+        output.writeString(embeddedProfilesJson);
     }
 
     @Override
@@ -122,6 +125,11 @@ public class ProxySetBean extends InternalBean {
             skipInsecureProfiles = input.readBoolean();
         } else {
             skipInsecureProfiles = false;
+        }
+        if (version >= 4) {
+            embeddedProfilesJson = input.readString();
+        } else {
+            embeddedProfilesJson = "[]";
         }
     }
 

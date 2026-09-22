@@ -1,10 +1,8 @@
 package io.nekohasekai.sagernet.group
 
-import android.annotation.SuppressLint
-import androidx.core.net.toUri
 import io.nekohasekai.sagernet.GroupOrder
+import io.nekohasekai.sagernet.GroupType
 import io.nekohasekai.sagernet.R
-import io.nekohasekai.sagernet.SpoofApp
 import io.nekohasekai.sagernet.SubscriptionFilterMode
 import io.nekohasekai.sagernet.bg.SubscriptionUpdater
 import io.nekohasekai.sagernet.database.*
@@ -18,50 +16,45 @@ import io.nekohasekai.sagernet.fmt.tailscale.TailscaleBean
 import io.nekohasekai.sagernet.fmt.trojan_go.parseTrojanGo
 import io.nekohasekai.sagernet.fmt.v2ray.StandardV2RayBean
 import io.nekohasekai.sagernet.fmt.wireguard.AmneziaWGBean
+import io.nekohasekai.sagernet.fmt.wireguard.applyAmneziaWG3Options
 import io.nekohasekai.sagernet.fmt.wireguard.WireGuardBean
 import io.nekohasekai.sagernet.fmt.wireguard.WireGuardConfDocument
 import io.nekohasekai.sagernet.fmt.wireguard.WireGuardConfParser
+import io.nekohasekai.sagernet.fmt.wireguard.parseAmneziaWGJsonContainer
 import io.nekohasekai.sagernet.ktx.*
 import io.nekohasekai.sagernet.routing.SubscriptionRoutingExtractor
 import io.nekohasekai.sagernet.routing.SubscriptionRoutingRepository
-import libcore.Libcore
 import moe.matsuri.nb4a.proxy.config.ConfigBean
-import moe.matsuri.nb4a.utils.Util
 import org.json.JSONArray
 import org.json.JSONObject
-import org.json.JSONTokener
 import java.util.Locale
-import kotlin.io.encoding.Base64
-import kotlin.io.encoding.ExperimentalEncodingApi
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 
-@OptIn(ExperimentalEncodingApi::class)
-internal fun decodeProfileTitle(headerValue: String): String? {
-    val value = headerValue.trim()
-    if (value.isEmpty() || value.equals("null", ignoreCase = true)) return null
-    if (!value.startsWith("base64:", ignoreCase = true)) return value
+internal fun mergeCurrentSubscriptionSettings(
+    current: SubscriptionBean,
+    updated: SubscriptionBean,
+) {
+    updated.link = current.link
+    updated.forceResolve = current.forceResolve
+    updated.deduplication = current.deduplication
+    updated.updateWhenConnectedOnly = current.updateWhenConnectedOnly
+    updated.customUserAgent = current.customUserAgent
+    updated.filterMode = current.filterMode
+    updated.filterRegex = current.filterRegex
+    updated.hwidEnabled = current.hwidEnabled
+    updated.spoofApp = current.spoofApp
+    updated.serverDnsResolver = current.serverDnsResolver
+    updated.bannerLayout = current.bannerLayout
+    updated.routingEnabled = current.routingEnabled
+    updated.routingUpdateInterval = current.routingUpdateInterval
 
-    val encoded = value.substringAfter(':').trim()
-    if (encoded.isEmpty()) return null
-    val padded = encoded.padEnd(encoded.length + (4 - encoded.length % 4) % 4, '=')
-
-    val decoded =
-        runCatching { Base64.Default.decode(padded) }
-            .recoverCatching { Base64.UrlSafe.decode(padded) }
-            .getOrNull()
-            ?: return null
-
-    return decoded
-        .toString(Charsets.UTF_8)
-        .trim()
-        .takeUnless { it.isEmpty() || it.equals("null", ignoreCase = true) }
-}
-
-internal fun profileUpdateIntervalMinutes(headerValue: String, isFirstUpdate: Boolean): Int? {
-    if (!isFirstUpdate) return null
-
-    val hours = headerValue.trim().toLongOrNull() ?: return null
-    if (hours <= 0L || hours > Int.MAX_VALUE / 60L) return null
-    return (hours * 60L).toInt()
+    if (current.providerAutoUpdateDefaultsApplied == true) {
+        updated.autoUpdate = current.autoUpdate
+        updated.autoUpdateDelay = current.autoUpdateDelay
+    }
+    updated.providerAutoUpdateDefaultsApplied = true
 }
 
 internal fun preserveMuxSettings(existing: AbstractBean, updated: AbstractBean) {
@@ -94,77 +87,11 @@ internal fun preserveMuxSettings(existing: AbstractBean, updated: AbstractBean) 
     }
 }
 
-internal data class XraySubscriptionBodyHeaders(
-    val profileTitle: String? = null,
-    val profileUpdateInterval: String? = null,
-    val subscriptionUserinfo: String? = null,
-    val announcement: String? = null,
-    val announcementUrl: String? = null,
-    val supportUrl: String? = null,
-    val supportEmail: String? = null,
-    val profileWebPageUrl: String? = null,
-    val homepage: String? = null,
-)
-
-internal fun parseXraySubscriptionBodyHeaders(text: String): XraySubscriptionBodyHeaders {
-    var profileTitle: String? = null
-    var profileUpdateInterval: String? = null
-    var subscriptionUserinfo: String? = null
-    var announcement: String? = null
-    var announcementUrl: String? = null
-    var supportUrl: String? = null
-    var supportEmail: String? = null
-    var profileWebPageUrl: String? = null
-    var homepage: String? = null
-
-    for ((index, rawLine) in text.lineSequence().withIndex()) {
-        val line = rawLine
-            .let { if (index == 0) it.removePrefix("\uFEFF") else it }
-            .trim()
-        if (line.isEmpty()) continue
-        if (!line.startsWith('#')) break
-
-        val header = line.substring(1).trimStart()
-        val separator = header.indexOf(':')
-        if (separator <= 0) continue
-
-        val name = header.substring(0, separator).trim().lowercase(Locale.ROOT)
-        val value = header.substring(separator + 1).trim().takeIf { it.isNotEmpty() } ?: continue
-        when (name) {
-            "profile-title" -> if (profileTitle == null) profileTitle = value
-            "profile-update-interval" -> if (profileUpdateInterval == null) {
-                profileUpdateInterval = value
-            }
-            "subscription-userinfo" -> if (subscriptionUserinfo == null) {
-                subscriptionUserinfo = value
-            }
-            "announce" -> if (announcement == null) announcement = value
-            "announce-url" -> if (announcementUrl == null) announcementUrl = value
-            "support-url" -> if (supportUrl == null) supportUrl = value
-            "support-email" -> if (supportEmail == null) supportEmail = value
-            "profile-web-page-url" -> if (profileWebPageUrl == null) profileWebPageUrl = value
-            "homepage" -> if (homepage == null) homepage = value
-        }
-    }
-
-    return XraySubscriptionBodyHeaders(
-        profileTitle,
-        profileUpdateInterval,
-        subscriptionUserinfo,
-        announcement,
-        announcementUrl,
-        supportUrl,
-        supportEmail,
-        profileWebPageUrl,
-        homepage,
-    )
-}
-
-internal fun responseOrBodyHeader(responseHeader: String, bodyHeader: String?): String =
-    responseHeader.ifBlank { bodyHeader.orEmpty() }
-
 @Suppress("EXPERIMENTAL_API_USAGE")
 object RawUpdater : GroupUpdater() {
+    internal var subscriptionReader: SubscriptionReader = DefaultSubscriptionReader
+    internal var contentParser: SubscriptionContentParser = DefaultSubscriptionContentParser
+
     private fun TailscaleBean.applyTailscaleOptions(options: Map<*, *>) {
         for ((rawKey, value) in options) {
             if (value == null) continue
@@ -211,7 +138,7 @@ object RawUpdater : GroupUpdater() {
             is List<*> -> value.filterNotNull().joinToString("\n") { it.toString() }
             else -> value.toString()
         }
-    @SuppressLint("Recycle")
+
     override suspend fun doUpdate(
         proxyGroup: ProxyGroup,
         subscription: SubscriptionBean,
@@ -219,319 +146,134 @@ object RawUpdater : GroupUpdater() {
         byUser: Boolean,
     ) {
         val link = subscription.link
-        var proxies: List<AbstractBean>
+        val originalName = proxyGroup.name
+        val document = subscriptionReader.read(subscription)
+        val responseText = document.body
+        var proxies = parseRaw(responseText) ?: error(
+            app.getString(
+                if (document.source == SubscriptionDocument.Source.CONTENT) {
+                    R.string.no_proxies_found_in_subscription
+                } else {
+                    R.string.no_proxies_found
+                },
+            ),
+        )
         var autoUpdateEnabledFromHeader = false
-        if (link.startsWith("content://")) {
-            val contentText =
-                app.contentResolver
-                    .openInputStream(link.toUri())
-                    ?.bufferedReader()
-                    ?.readText()
-
-            proxies = contentText?.let { parseRaw(contentText) }
-                ?: error(app.getString(R.string.no_proxies_found_in_subscription))
+        if (document.source == SubscriptionDocument.Source.CONTENT) {
             runCatching {
                 SubscriptionRoutingRepository.updateStored(
                     subscription,
-                    SubscriptionRoutingExtractor.extract("", "", contentText),
+                    SubscriptionRoutingExtractor.extract("", "", responseText),
                     proxyGroup.id,
                 )
             }.onFailure(Logs::w)
         } else {
-            val client =
-                Libcore.newHttpClient().apply {
-                    setTimeoutMillis(GroupUpdater.SUBSCRIPTION_UPDATE_TIMEOUT_MILLIS)
-                    tryH3Direct()
-                    when (DataStore.appTLSVersion) {
-                        "1.3" -> restrictedTLS()
-                    }
-                }
-            try {
-                val response =
-                    client
-                        .newRequest()
-                        .apply {
-                            if (DataStore.allowInsecureOnRequest) {
-                                allowInsecure()
-                            }
-                            setURL(subscription.link)
-                            val fingerprint =
-                                buildSubscriptionRequestFingerprint(
-                                    spoofApp = subscription.spoofApp ?: SpoofApp.NONE,
-                                    hwidEnabled = subscription.hwidEnabled == true,
-                                    customUserAgent = subscription.customUserAgent,
-                                    fallbackUserAgent = USER_AGENT,
-                                )
-                            setUserAgent(fingerprint.userAgent)
-                            for ((name, value) in fingerprint.headers) {
-                                setHeader(name, value)
-                            }
-                        }.execute()
+            if (document.headers["x-hwid-not-supported"].equals("true", ignoreCase = true)) {
+                error(app.getString(R.string.hwid_not_supported))
+            } else if (
+                document.headers["x-hwid-max-devices-reached"].equals("true", ignoreCase = true) ||
+                document.headers["x-hwid-limit"].equals("true", ignoreCase = true)
+            ) {
+                error(app.getString(R.string.hwid_max_devices_reached))
+            }
 
-                if (Util.getStringBox(response.getHeader("x-hwid-not-supported")).lowercase() == "true") {
-                    error(app.getString(R.string.hwid_not_supported))
-                } else if (Util.getStringBox(response.getHeader("x-hwid-max-devices-reached")).lowercase() == "true" ||
-                    Util.getStringBox(response.getHeader("x-hwid-limit")).lowercase() == "true"
-                ) {
-                    error(app.getString(R.string.hwid_max_devices_reached))
-                }
+            runCatching {
+                val routingSource = SubscriptionRoutingExtractor.extract(
+                    document.headers["autorouting"],
+                    document.headers["routing"],
+                    responseText,
+                )
+                SubscriptionRoutingRepository.updateStored(subscription, routingSource, proxyGroup.id)
+            }.onFailure(Logs::w)
+            val metadata = SubscriptionMetadataParser.parse(
+                document,
+                isFirstUpdate = subscription.providerAutoUpdateDefaultsApplied != true,
+            )
+            subscription.subscriptionUserinfo = metadata.userinfo
+            subscription.expireAt = metadata.expireAt
+            subscription.announcement = metadata.announcement
+            subscription.announcementUrl = metadata.announcementUrl
+            subscription.supportUrl = metadata.supportUrl
+            subscription.supportEmail = metadata.supportEmail
+            subscription.profileWebPageUrl = metadata.profileWebPageUrl
+            subscription.homepage = metadata.homepage
+            metadata.autoUpdateIntervalMinutes?.let { intervalMinutes ->
+                subscription.autoUpdate = true
+                subscription.autoUpdateDelay = intervalMinutes
+                autoUpdateEnabledFromHeader = true
+            }
+            subscription.providerAutoUpdateDefaultsApplied = true
 
-                val responseText = Util.getStringBox(response.contentString)
-                proxies = parseRaw(responseText)
-                    ?: error(app.getString(R.string.no_proxies_found))
-                runCatching {
-                    val routingSource = SubscriptionRoutingExtractor.extract(
-                        Util.getStringBox(response.getHeader("autorouting")),
-                        Util.getStringBox(response.getHeader("routing")),
-                        responseText,
-                    )
-                    SubscriptionRoutingRepository.updateStored(
-                        subscription,
-                        routingSource,
-                        proxyGroup.id,
-                    )
-                }.onFailure(Logs::w)
-                val bodyHeaders = parseXraySubscriptionBodyHeaders(responseText)
-
-                subscription.subscriptionUserinfo =
-                    responseOrBodyHeader(
-                        Util.getStringBox(response.getHeader("Subscription-Userinfo")),
-                        bodyHeaders.subscriptionUserinfo,
-                    )
-                subscription.announcement =
-                    decodeProfileTitle(
-                        responseOrBodyHeader(
-                            Util.getStringBox(response.getHeader("announce")),
-                            bodyHeaders.announcement,
-                        ),
-                    ).orEmpty()
-                subscription.announcementUrl =
-                    responseOrBodyHeader(
-                        Util.getStringBox(response.getHeader("announce-url")),
-                        bodyHeaders.announcementUrl,
-                    )
-                subscription.supportUrl =
-                    responseOrBodyHeader(
-                        Util.getStringBox(response.getHeader("support-url")),
-                        bodyHeaders.supportUrl,
-                    )
-                subscription.supportEmail =
-                    responseOrBodyHeader(
-                        Util.getStringBox(response.getHeader("support-email")),
-                        bodyHeaders.supportEmail,
-                    )
-                subscription.profileWebPageUrl =
-                    responseOrBodyHeader(
-                        Util.getStringBox(response.getHeader("profile-web-page-url")),
-                        bodyHeaders.profileWebPageUrl,
-                    )
-                subscription.homepage =
-                    responseOrBodyHeader(
-                        Util.getStringBox(response.getHeader("homepage")),
-                        bodyHeaders.homepage,
-                    )
-
-                val updateIntervalHeader =
-                    responseOrBodyHeader(
-                        Util.getStringBox(response.getHeader("profile-update-interval")),
-                        bodyHeaders.profileUpdateInterval,
-                    )
-                profileUpdateIntervalMinutes(
-                    updateIntervalHeader,
-                    isFirstUpdate = subscription.lastUpdated == 0,
-                )?.let { intervalMinutes ->
-                    subscription.autoUpdate = true
-                    subscription.autoUpdateDelay = intervalMinutes
-                    autoUpdateEnabledFromHeader = true
-                }
-
-                // 修改默认名字
-                if (proxyGroup.name?.startsWith("Subscription #") == true) {
-                    val profileTitleHeader =
-                        responseOrBodyHeader(
-                            Util.getStringBox(response.getHeader("profile-title")),
-                            bodyHeaders.profileTitle,
-                        )
-                    var remoteName =
-                        decodeProfileTitle(profileTitleHeader)
-                    if (remoteName.isNullOrBlank()) {
-                        remoteName = Util.getStringBox(response.getHeader("content-disposition"))
-                            .takeIf { it.isNotBlank() }
-                            ?.let { Util.decodeFilename(it) }
-                    }
-                    if (!remoteName.isNullOrBlank()) {
-                        proxyGroup.name = remoteName
-                    }
-                }
-            } finally {
-                client.close()
+            // 修改默认名字
+            if (proxyGroup.name?.startsWith("Subscription #") == true) {
+                metadata.suggestedName?.takeIf(String::isNotBlank)?.let { proxyGroup.name = it }
             }
         }
+        subscription.providerAutoUpdateDefaultsApplied = true
 
-        val proxiesMap = LinkedHashMap<String, AbstractBean>()
-        for (proxy in proxies) {
-            var index = 0
-            var name = proxy.displayName()
-            while (proxiesMap.containsKey(name)) {
-                println("Exists name: $name")
-                index++
-                name = name.replace(" (${index - 1})", "")
-                name = "$name ($index)"
-                proxy.name = name
-            }
-            proxiesMap[proxy.displayName()] = proxy
+        coroutineContext.ensureActive()
+        val currentGroup = AppData.groups.getById(proxyGroup.id)
+            ?: throw CancellationException("Subscription group was deleted")
+        val currentSubscription = currentGroup.subscription
+            ?: throw CancellationException("Subscription group no longer exists")
+        if (currentGroup.type != GroupType.SUBSCRIPTION || currentSubscription.link != link) {
+            throw CancellationException("Subscription changed during update")
         }
-        proxies = proxiesMap.values.toList()
+        if (!byUser && currentSubscription.autoUpdate != true) {
+            throw CancellationException("Automatic subscription update was disabled")
+        }
+        mergeCurrentSubscriptionSettings(currentSubscription, subscription)
+        proxyGroup.apply {
+            userOrder = currentGroup.userOrder
+            ungrouped = currentGroup.ungrouped
+            name = if (currentGroup.name == originalName) name else currentGroup.name
+            type = currentGroup.type
+            order = currentGroup.order
+            isSelector = currentGroup.isSelector
+            frontProxy = currentGroup.frontProxy
+            landingProxy = currentGroup.landingProxy
+            forceUTLS = currentGroup.forceUTLS
+            enableMux = currentGroup.enableMux
+            muxType = currentGroup.muxType
+            muxMode = currentGroup.muxMode
+            muxConcurrency = currentGroup.muxConcurrency
+            muxMaxConnections = currentGroup.muxMaxConnections
+            muxMinStreams = currentGroup.muxMinStreams
+            muxPadding = currentGroup.muxPadding
+            muxBrutal = currentGroup.muxBrutal
+            muxBrutalUpMbps = currentGroup.muxBrutalUpMbps
+            muxBrutalDownMbps = currentGroup.muxBrutalDownMbps
+        }
+
+        proxies = SubscriptionProfilePolicy.assignUniqueNames(proxies)
 
         if (subscription.forceResolve) forceResolve(proxies, proxyGroup.id)
 
         val filterMode = subscription.filterMode ?: SubscriptionFilterMode.DISABLED
         val filterRegex = subscription.filterRegex ?: ""
         if (filterMode != SubscriptionFilterMode.DISABLED && filterRegex.isNotBlank()) {
-            val regex = filterRegex.toRegex()
-            proxies =
-                when (filterMode) {
-                    SubscriptionFilterMode.INCLUDE -> proxies.filter { regex.containsMatchIn(it.displayName()) }
-                    SubscriptionFilterMode.EXCLUDE -> proxies.filterNot { regex.containsMatchIn(it.displayName()) }
-                    else -> proxies
-                }
+            proxies = SubscriptionProfilePolicy.filter(proxies, filterMode, filterRegex)
             Logs.d("After filter (mode=$filterMode): ${proxies.size}")
         }
 
-        val exists = SagerDatabase.proxyDao.getByGroup(proxyGroup.id)
         val duplicate = ArrayList<String>()
         if (subscription.deduplication) {
             Logs.d("Before deduplication: ${proxies.size}")
-            val uniqueProxyHashes = ArrayList<String>()
-            val uniqueProxies = LinkedHashMap<String, AbstractBean>()
-            val uniqueNames = HashMap<String, String>()
-            for (_proxy in proxies) {
-                val proxyHash = _proxy.hash
-                val existingIndex = uniqueProxyHashes.indexOf(proxyHash)
-                if (existingIndex >= 0) {
-                    if (uniqueNames.containsKey(proxyHash)) {
-                        val name = uniqueNames[proxyHash]!!.replace(" ($existingIndex)", "")
-                        if (name.isNotBlank()) {
-                            duplicate.add("$name ($existingIndex)")
-                            uniqueNames[proxyHash] = ""
-                        }
-                    }
-                    duplicate.add(_proxy.displayName() + " ($existingIndex)")
-                } else {
-                    uniqueProxyHashes.add(proxyHash)
-                    uniqueProxies[proxyHash] = _proxy
-                    uniqueNames[proxyHash] = _proxy.displayName()
-                }
-            }
-            uniqueProxies.keys.retainAll(uniqueNames.keys)
-            proxies = uniqueProxies.values.toList()
+            val result = SubscriptionProfilePolicy.deduplicate(proxies)
+            proxies = result.profiles
+            duplicate += result.duplicateNames
         }
 
         Logs.d("New profiles: ${proxies.size}")
 
-        val nameMap =
-            proxies.associateBy { bean ->
-                bean.displayName()
-            }
-
-        Logs.d("Unique profiles: ${nameMap.size}")
-
-        val toDelete = ArrayList<ProxyEntity>()
-        val toReplace =
-            exists
-                .mapNotNull { entity ->
-                    val name = entity.displayName()
-                    if (nameMap.contains(name)) {
-                        name to entity
-                    } else {
-                        let {
-                            toDelete.add(entity)
-                            null
-                        }
-                    }
-                }.toMap()
-
-        Logs.d("toDelete profiles: ${toDelete.size}")
-        Logs.d("toReplace profiles: ${toReplace.size}")
-
-        val toUpdate = ArrayList<ProxyEntity>()
-        val added = mutableListOf<String>()
-        val updated = mutableMapOf<String, String>()
-        val deleted = toDelete.map { it.displayName() }
-
         val shouldApplyUpdateOrder =
             proxyGroup.order != GroupOrder.MANUAL &&
                 (DataStore.groupOrderModeAlways || DataStore.groupOrderModeUpdate)
-        var userOrder = 1L
-        var appendedUserOrder = SagerDatabase.proxyDao.nextOrder(proxyGroup.id) ?: 1L
-        var changed = toDelete.size
-        val originOrderIds = mutableListOf<Long>()
-        for ((name, bean) in nameMap.entries) {
-            if (toReplace.contains(name)) {
-                val entity = toReplace[name]!!
-                originOrderIds.add(entity.id)
-                val existsBean = entity.requireBean()
-                // 更新订阅，保留自定义覆写设置
-                bean.customOutboundJson = existsBean.customOutboundJson
-                bean.customConfigJson = existsBean.customConfigJson
-                preserveMuxSettings(existsBean, bean)
-                when {
-                    existsBean != bean -> {
-                        changed++
-                        entity.putBean(bean)
-                        toUpdate.add(entity)
-                        updated[entity.displayName()] = name
-
-                        Logs.d("Updated profile: $name")
-                    }
-
-                    shouldApplyUpdateOrder && entity.userOrder != userOrder -> {
-                        entity.putBean(bean)
-                        toUpdate.add(entity)
-                        entity.userOrder = userOrder
-
-                        Logs.d("Reordered profile: $name")
-                    }
-
-                    else -> {
-                        Logs.d("Ignored profile: $name")
-                    }
-                }
-            } else {
-                changed++
-                val profileId =
-                    SagerDatabase.proxyDao.addProxy(
-                        ProxyEntity(
-                            groupId = proxyGroup.id,
-                            userOrder = if (shouldApplyUpdateOrder) userOrder else appendedUserOrder++,
-                        ).apply {
-                            putBean(bean)
-                        },
-                    )
-                originOrderIds.add(profileId)
-                added.add(name)
-                Logs.d("Inserted profile: $name")
-            }
-            userOrder++
-        }
-
-        SagerDatabase.proxyDao.updateProxy(toUpdate).also {
-            Logs.d("Updated profiles: $it")
-        }
-
-        SagerDatabase.proxyDao.deleteProxy(toDelete).also {
-            Logs.d("Deleted profiles: $it")
-        }
-
-        val existCount = SagerDatabase.proxyDao.countByGroup(proxyGroup.id).toInt()
-
-        if (existCount != proxies.size) {
-            Logs.e("Exist profiles: $existCount, new profiles: ${proxies.size}")
-        }
-
-        subscription.lastUpdated = (System.currentTimeMillis() / 1000).toInt()
-        proxyGroup.setOriginOrderIds(originOrderIds)
-        SagerDatabase.groupDao.updateGroup(proxyGroup)
+        val syncResult = SubscriptionProfileSynchronizer.synchronize(
+            proxyGroup,
+            proxies,
+            shouldApplyUpdateOrder,
+        )
         if (
             autoUpdateEnabledFromHeader ||
             (subscription.routingEnabled == true && subscription.autoRoutingUrl.isNotBlank())
@@ -541,10 +283,10 @@ object RawUpdater : GroupUpdater() {
 
         userInterface?.onUpdateSuccess(
             proxyGroup,
-            changed,
-            added,
-            updated,
-            deleted,
+            syncResult.changed,
+            syncResult.added,
+            syncResult.updated,
+            syncResult.deleted,
             duplicate,
             byUser,
         )
@@ -554,59 +296,7 @@ object RawUpdater : GroupUpdater() {
     suspend fun parseRaw(
         text: String,
         fileName: String = "",
-    ): List<AbstractBean>? {
-        val proxies = mutableListOf<AbstractBean>()
-
-        XrayParser.parse(text)?.let { parsed ->
-            return parsed.takeIf { it.isNotEmpty() }
-        }
-
-        ClashParser.parse(text)?.let { parsed ->
-            return parsed.takeIf { it.isNotEmpty() }
-        }
-
-        if (WireGuardConfParser.looksLikeWireGuardConf(text)) {
-            // AmneziaWG or WireGuard .conf
-            try {
-                val document = WireGuardConfParser.parse(text)
-                proxies.addAll(
-                    (if (document.isAmneziaWG) {
-                        parseAmneziaWG(document)
-                    } else {
-                        parseWireGuard(document)
-                    }).map {
-                        if (fileName.isNotBlank()) it.name = fileName.removeSuffix(".conf")
-                        it
-                    },
-                )
-                return proxies
-            } catch (e: Exception) {
-                Logs.w(e)
-            }
-        }
-
-        try {
-            val json = JSONTokener(text).nextValue()
-            return parseJSON(json)
-        } catch (ignored: Exception) {
-        }
-
-        try {
-            return parseProxies(text.decodeBase64UrlSafe()).takeIf { it.isNotEmpty() }
-                ?: error("Not found")
-        } catch (e: Exception) {
-            if (e is AmneziaApiKeyUnsupportedException) throw e
-            Logs.w(e)
-        }
-
-        try {
-            return parseProxies(text).takeIf { it.isNotEmpty() } ?: error("Not found")
-        } catch (e: Exception) {
-            if (e is AmneziaApiKeyUnsupportedException) throw e
-        }
-
-        return null
-    }
+    ): List<AbstractBean>? = contentParser.parse(text, fileName)
 
     fun parseWireGuard(conf: String): List<WireGuardBean> =
         parseWireGuard(WireGuardConfParser.parse(conf))
@@ -667,14 +357,7 @@ object RawUpdater : GroupUpdater() {
         // AWG 2.0 parameters
         iface["S3"]?.toIntOrNull()?.let { bean.s3 = it }
         iface["S4"]?.toIntOrNull()?.let { bean.s4 = it }
-        // AWG 3.0 parameters
-        iface["HeaderProtectionKey"]?.let { bean.headerProtectionKey = it }
-        iface["ContentPaddingAddition"]?.let { bean.contentPaddingAddition = it }
-        iface["RekeyAfterTime"]?.let { bean.rekeyAfterTime = it }
-        iface["RekeyTimeout"]?.let { bean.rekeyTimeout = it }
-        iface["RejectAfterTime"]?.let { bean.rejectAfterTime = it }
-        iface["KeepaliveTimeout"]?.let { bean.keepaliveTimeout = it }
-        iface["MaxHandshakeAttempts"]?.let { bean.maxHandshakeAttempts = it }
+        bean.applyAmneziaWG3Options { iface[it] }
         val peers = document.peers
         if (peers.isNullOrEmpty()) error("Missing 'Peer' selections")
         val beans = mutableListOf<AmneziaWGBean>()
@@ -733,6 +416,8 @@ object RawUpdater : GroupUpdater() {
                     else -> MieruBean.HANDSHAKE_DEFAULT
                 }
                 trafficPattern = getStr("traffic_pattern") ?: ""
+                lowEntropyMode = getStr("low_entropy_mode") ?: ""
+                lowEntropyMaskRotation = getStr("low_entropy_mask_rotation") ?: ""
             }
         }
 
@@ -746,12 +431,24 @@ object RawUpdater : GroupUpdater() {
 
         if (json is JSONObject) {
             when {
+                json.getStr("type") == "amneziawg" -> {
+                    return parseAmneziaWGJsonContainer(json)
+                }
+
                 json.getStr("type") == "mieru" -> {
                     return listOfNotNull(json.parseSingBoxMieru())
                 }
 
                 json.getStr("type") == "tailscale" -> {
                     return listOfNotNull(json.parseSingBoxTailscale())
+                }
+
+                json.getStr("type") in setOf("openvpn", "openvpn-client") -> {
+                    return listOfNotNull(SingBoxEndpointParser.parseOpenVPN(json))
+                }
+
+                json.getStr("type") == "openconnect" -> {
+                    return listOfNotNull(SingBoxEndpointParser.parseOpenConnect(json))
                 }
 
                 json.has("server") && (json.has("up") || json.has("up_mbps")) -> {
@@ -803,7 +500,9 @@ object RawUpdater : GroupUpdater() {
                         ?.mapNotNull { endpoint ->
                             endpoint.parseSingBoxTailscale()?.apply {
                                 magicDNS = endpoint.getStr("tag") in magicDnsEndpoints
-                            } ?: ConfigBean().apply {
+                            } ?: SingBoxEndpointParser.parseOpenVPN(endpoint)
+                                ?: SingBoxEndpointParser.parseOpenConnect(endpoint)
+                                ?: ConfigBean().apply {
                                 applyDefaultValues()
                                 type = 1
                                 config = endpoint.toStringPretty()
